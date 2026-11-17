@@ -2,16 +2,19 @@
 //!
 //! Since macOS 26, AppKit puts the buttons back at (9, 9) and the titlebar container back to
 //! its own height whenever it lays the titlebar out again, which it does on its own (a title
-//! or appearance change, a zoom), not only on the resizes the shell sees. So the container and
-//! the buttons' own superview each get a subclass, for that instance only, whose `-layout` runs
-//! AppKit's and then puts the buttons back.
+//! or appearance change, a zoom), not only on the resizes the shell sees. So the classes of the
+//! container and of the buttons' own superview get a `-layout` hook that runs AppKit's and then
+//! puts the buttons back. The hook sits on the class, not on a per-instance subclass: on macOS 26
+//! AppKit already observes the container with KVO before Rune sees it, and moving such a view to
+//! another class hides KVO's own subclass, so AppKit's observer gets no value and aborts.
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
+use std::ffi::CStr;
 
 use objc2::rc::Retained;
-use objc2::runtime::{AnyClass, AnyObject, ClassBuilder, Sel};
-use objc2::{msg_send, sel};
+use objc2::runtime::{AnyClass, AnyObject, Imp, Sel};
+use objc2::sel;
 use objc2_app_kit::{NSView, NSWindow, NSWindowButton, NSWindowStyleMask};
 use objc2_foundation::NSPoint;
 use winit::window::Window;
@@ -23,6 +26,9 @@ thread_local! {
     static SPOTS: RefCell<HashMap<usize, (f64, f64)>> = RefCell::new(HashMap::new());
     /// Set while the hook places, so the frames it sets don't place again.
     static PLACING: Cell<bool> = const { Cell::new(false) };
+    /// Each AppKit class whose `-layout` Rune hooked, by class pointer, with the implementation
+    /// the hook replaced: `None` when the class inherited `-layout` and the hook was added to it.
+    static HOOKED: RefCell<HashMap<usize, Option<Imp>>> = RefCell::new(HashMap::new());
 }
 
 /// Drops its window's spot when the window goes, so a later window at the same address
@@ -90,13 +96,16 @@ fn place_in(win: &NSWindow, (x, y): (f64, f64)) {
     PLACING.with(|p| p.set(false));
 }
 
-/// Runs AppKit's `-layout` for the view's real class, then puts the buttons back.
-unsafe extern "C" fn layout(view: &NSView, _: Sel) {
-    // Not `view.class()`'s superclass: entering full screen, AppKit observes the container and
-    // KVO puts its own subclass above Rune's, whose superclass is Rune's again.
-    let base = held_class(view).and_then(AnyClass::superclass).expect("Rune traffic-light view has a superclass");
-    // SAFETY: `base` is the class this instance had before `hold`, which implements -layout.
-    let _: () = unsafe { msg_send![super(view, base), layout] };
+/// Runs AppKit's `-layout` for the view's class, then puts the buttons back.
+unsafe extern "C" fn layout(view: &NSView, sel: Sel) {
+    if let Some(imp) = original(own_class(view)) {
+        // SAFETY: `imp` is AppKit's -[NSView layout] implementation for this class chain, whose
+        // signature is `(id, SEL) -> void`.
+        unsafe {
+            let f: unsafe extern "C" fn(&NSView, Sel) = std::mem::transmute(imp);
+            f(view, sel);
+        }
+    }
     if PLACING.with(Cell::get) {
         return;
     }
@@ -105,27 +114,72 @@ unsafe extern "C" fn layout(view: &NSView, _: Sel) {
     place_in(&win, spot);
 }
 
-/// Gives this one view a subclass of its own class whose `-layout` places the buttons again.
-unsafe fn hold(view: &NSView) {
-    if held_class(view).is_some() {
+/// Hooks `-layout` on this view's AppKit class, once per class. A class that inherits `-layout`
+/// gets the hook added to it alone; one that defines it has its implementation swapped and kept.
+/// Every view of the class then runs the hook, and `layout` leaves a window without a spot as
+/// AppKit laid it out.
+unsafe fn hold(view: &AnyObject) {
+    let class = own_class(view);
+    let key = class as *const AnyClass as usize;
+    if HOOKED.with(|h| h.borrow().contains_key(&key)) {
         return;
     }
-    let base = view.class();
-    let name = format!("RuneTrafficLights_{}", base.name());
-    let class = match ClassBuilder::new(&name, base) {
-        Some(mut builder) => {
-            // SAFETY: the signature matches -[NSView layout].
-            unsafe { builder.add_method(sel!(layout), layout as unsafe extern "C" fn(_, _)) };
-            builder.register()
+    let sel = sel!(layout);
+    // SAFETY: the signature matches -[NSView layout]; `Imp` is the untyped function pointer.
+    let hook: Imp = unsafe { std::mem::transmute(layout as unsafe extern "C" fn(&NSView, Sel)) };
+    let replaced = if defines(class, sel) {
+        let Some(method) = class.instance_method(sel) else { return };
+        // SAFETY: same signature; the old implementation is kept and called by the hook.
+        Some(unsafe { method.set_implementation(hook) })
+    } else {
+        let types: &CStr = c"v16@0:8";
+        // SAFETY: a registered class, a matching type encoding, on the main thread.
+        let added = unsafe {
+            objc2::ffi::class_addMethod(class as *const AnyClass as *mut objc2::ffi::objc_class, sel.as_ptr(), Some(hook), types.as_ptr())
+        };
+        if added == objc2::ffi::NO {
+            return;
         }
-        None => AnyClass::get(&name).expect("register Rune traffic-light view"),
+        None
     };
-    // SAFETY: a live view on the main thread. Only its isa changes, to a subclass without
-    // ivars; the original class is never modified.
-    unsafe { AnyObject::set_class(view, class) };
+    HOOKED.with(|h| h.borrow_mut().insert(key, replaced));
 }
 
-/// The subclass `hold` gave this view, wherever it sits in the view's class chain.
-fn held_class(view: &NSView) -> Option<&'static AnyClass> {
-    std::iter::successors(Some(view.class()), |c| c.superclass()).find(|c| c.name().starts_with("RuneTrafficLights_"))
+/// The view's AppKit class, under the runtime subclass KVO puts above an observed view.
+fn own_class(view: &AnyObject) -> &'static AnyClass {
+    let mut class = view.class();
+    while class.name().starts_with("NSKVONotifying_") {
+        match class.superclass() {
+            Some(superclass) => class = superclass,
+            None => break,
+        }
+    }
+    class
 }
+
+/// Whether `class` has its own `sel`, not one it inherits.
+fn defines(class: &AnyClass, sel: Sel) -> bool {
+    let Some(own) = class.instance_method(sel) else { return false };
+    class.superclass().and_then(|s| s.instance_method(sel)).is_none_or(|inherited| !std::ptr::eq(own, inherited))
+}
+
+/// AppKit's own `-layout` for `class`: the implementation a hook replaced, or the nearest one up
+/// the chain that is not a hook.
+fn original(class: &AnyClass) -> Option<Imp> {
+    let sel = sel!(layout);
+    let mut class = class;
+    loop {
+        let key = class as *const AnyClass as usize;
+        match HOOKED.with(|h| h.borrow().get(&key).copied()) {
+            Some(Some(imp)) => return Some(imp),
+            Some(None) => {}
+            None if defines(class, sel) => return class.instance_method(sel).map(|m| m.implementation()),
+            None => {}
+        }
+        class = class.superclass()?;
+    }
+}
+
+#[cfg(test)]
+#[path = "traffic_lights_tests.rs"]
+mod tests;
